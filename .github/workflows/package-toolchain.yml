@@ -18,9 +18,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:RUNNER_TEMP "winsdksetup.exe"
           Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2370315" -OutFile $installer
-          $args = "/features OptionId.WindowsSoftwareDevelopmentKit OptionId.WindowsDesktopDebuggers /quiet /norestart"
+          $log = Join-Path $env:RUNNER_TEMP "sdk-install.log"
+          $args = "/features + /quiet /norestart /log `"$log`""
           $p = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
           Write-Host "SDK installer exit code: $($p.ExitCode)"
+          if (Test-Path $log) {
+            Write-Host "---- SDK installer log tail ----"
+            Get-Content $log -Tail 80
+          }
           $sdk = "C:\Program Files (x86)\Windows Kits\10"
           $deadline = (Get-Date).AddMinutes(10)
           while (-not (Test-Path "$sdk\Include\10.0.28000.0") -and (Get-Date) -lt $deadline) {
