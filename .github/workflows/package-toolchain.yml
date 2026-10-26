@@ -1,0 +1,104 @@
+name: Package Chromium Windows Toolchain
+
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Windows SDK 10.0.28000.2270
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "winsdksetup.exe"
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2370315" -OutFile $installer
+          $args = "/features OptionId.WindowsSoftwareDevelopmentKit OptionId.WindowsDesktopDebuggers /quiet /norestart"
+          $p = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+          Write-Host "SDK installer exit code: $($p.ExitCode)"
+          $sdk = "C:\Program Files (x86)\Windows Kits\10"
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not (Test-Path "$sdk\Include\10.0.28000.0") -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+          }
+          if (-not (Test-Path "$sdk\Include\10.0.28000.0")) {
+            throw "Windows SDK 10.0.28000.0 was not installed"
+          }
+          if (-not (Test-Path "$sdk\Debuggers\x64\dbghelp.dll")) {
+            throw "Windows SDK debugging tools are missing"
+          }
+          Get-ChildItem "$sdk\Include" | Select-Object Name
+
+      - name: Clone depot_tools
+        shell: pwsh
+        run: git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+
+      - name: Patch packager for hosted runner MSVC layout
+        shell: pwsh
+        run: |
+          $path = "depot_tools/win_toolchain/package_from_installed.py"
+          $script = @'
+          import pathlib
+          import re
+
+          path = pathlib.Path("depot_tools/win_toolchain/package_from_installed.py")
+          text = path.read_text()
+          replacement = r'''def _WildcardVersionKey(path):
+              import re
+              return ([int(piece) for piece in re.findall(r'\d+', path)], path.lower())
+
+
+          def ExpandWildcards(root, sub_dir):
+              # normpath is needed to change '/' to '\\' characters.
+              path = os.path.normpath(os.path.join(root, sub_dir))
+              matches = glob.glob(path)
+              if len(matches) == 1:
+                  return matches[0]
+              if len(matches) > 1:
+                  selected = sorted(matches, key=_WildcardVersionKey)[-1]
+                  print('%s had %d matches; using latest %s.' %
+                        (path, len(matches), selected))
+                  return selected
+              raise Exception('%s had %d matches - should be one' %
+                              (path, len(matches)))
+          '''
+          pattern = r"def ExpandWildcards\(root, sub_dir\):\r?\n.*?\r?\n(?=def BuildRepackageFileList)"
+          text, count = re.subn(pattern, lambda _: replacement + "\n", text, count=1, flags=re.S)
+          if count != 1 or "using latest" not in text:
+              raise SystemExit("Failed to patch ExpandWildcards")
+          path.write_text(text)
+          '@
+          python -c $script
+
+      - name: Package installed VS and Windows SDK
+        shell: pwsh
+        working-directory: depot_tools/win_toolchain
+        run: |
+          $ErrorActionPreference = "Stop"
+          python package_from_installed.py 2026 -w 10.0.28000.0
+          $zip = Get-ChildItem *.zip | Select-Object -First 1
+          if (-not $zip) { throw "No toolchain zip produced" }
+          $hash = [IO.Path]::GetFileNameWithoutExtension($zip.Name)
+          Write-Host "Toolchain hash: $hash"
+          "### Chromium Windows toolchain hash: $hash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload toolchain to build droplet
+        shell: pwsh
+        env:
+          DO_SSH_KEY: ${{ secrets.DO_SSH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:DO_SSH_KEY)) { throw "DO_SSH_KEY secret is missing" }
+          $keyPath = Join-Path $env:RUNNER_TEMP "do_key"
+          [IO.File]::WriteAllText($keyPath, $env:DO_SSH_KEY.Replace("`r`n", "`n") + "`n", [Text.UTF8Encoding]::new($false))
+          icacls $keyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+          $zip = Get-ChildItem depot_tools/win_toolchain/*.zip | Select-Object -First 1
+          $hash = [IO.Path]::GetFileNameWithoutExtension($zip.Name)
+          ssh -i $keyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL root@138.68.19.48 "mkdir -p /home/builder/toolchain && chown builder:builder /home/builder/toolchain"
+          scp -i $keyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL $zip.FullName "root@138.68.19.48:/home/builder/toolchain/$hash.zip"
+          ssh -i $keyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL root@138.68.19.48 "echo '$hash' > /home/builder/toolchain/HASH; chown -R builder:builder /home/builder/toolchain; ls -lh /home/builder/toolchain/$hash.zip"
